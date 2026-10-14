@@ -26,17 +26,58 @@ import torch
 from huggingface_hub import ModelCard, delete_repo, snapshot_download, try_to_load_from_cache
 from huggingface_hub.utils import HfHubHTTPError, is_jinja_available
 
-from diffusers.models import FluxTransformer2DModel, SD3Transformer2DModel, UNet2DConditionModel
+from diffusers.models import FluxTransformer2DModel, SD3Transformer2DModel, UNet2DConditionModel, UNet2DModel
 
 from ..others.test_utils import TOKEN, USER, is_staging_test
 from ..testing_utils import (
     CaptureLogger,
+    assert_tensors_close,
     require_torch_accelerator,
     torch_device,
 )
 
 
 class TestModelUtils:
+    @pytest.mark.parametrize("sharded", [False, True], ids=["single_file", "sharded"])
+    @pytest.mark.parametrize("device_map", [None, {"": "cpu"}], ids=["default", "cpu_device_map"])
+    @pytest.mark.parametrize("parallel_loading", [False, True], ids=["serial", "parallel"])
+    @torch.no_grad()
+    def test_from_pretrained_offload_state_dict(self, tmp_path, monkeypatch, sharded, device_map, parallel_loading):
+        if parallel_loading and not sharded:
+            pytest.skip("Parallel loading requires multiple checkpoint shards.")
+
+        offload_folder = tmp_path / "state_dict_offload"
+
+        def make_tempdir():
+            offload_folder.mkdir()
+            return str(offload_folder)
+
+        monkeypatch.setattr("diffusers.models.modeling_utils.tempfile.mkdtemp", make_tempdir)
+        monkeypatch.setattr("diffusers.models.modeling_utils.HF_ENABLE_PARALLEL_LOADING", parallel_loading)
+
+        model = UNet2DModel(
+            sample_size=8,
+            in_channels=3,
+            out_channels=3,
+            layers_per_block=1,
+            block_out_channels=(4, 8),
+            down_block_types=("DownBlock2D", "DownBlock2D"),
+            up_block_types=("UpBlock2D", "UpBlock2D"),
+            norm_num_groups=2,
+        ).eval()
+        inputs = {"sample": torch.randn(1, 3, 8, 8), "timestep": torch.tensor([1])}
+        expected = model(**inputs).sample
+        model.save_pretrained(tmp_path, max_shard_size="10KB" if sharded else "5GB")
+
+        kwargs = {"offload_state_dict": True}
+        if device_map is not None:
+            kwargs["device_map"] = device_map
+        loaded = UNet2DModel.from_pretrained(tmp_path, **kwargs).eval()
+
+        assert not any(parameter.is_meta for parameter in loaded.parameters())
+        assert_tensors_close(expected, loaded(**inputs).sample)
+        assert not offload_folder.exists()
+
     def test_missing_key_loading_warning_message(self):
         logger = logging.getLogger("diffusers.models.modeling_utils")
         with CaptureLogger(logger) as cap_logger:
